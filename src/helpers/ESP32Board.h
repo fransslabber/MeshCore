@@ -21,6 +21,7 @@ class ESP32Board : public mesh::MainBoard {
 protected:
   uint8_t startup_reason;
   bool inhibit_sleep = false;
+  int extra_wake_pin = -1;   // optional active-high GPIO that also wakes from light sleep (-1 = none)
   static inline portMUX_TYPE sleepMux = portMUX_INITIALIZER_UNLOCKED;
 
 public:
@@ -91,8 +92,8 @@ public:
     // Disable CPU interrupt servicing
     portENTER_CRITICAL(&sleepMux);
 
-    // Skip sleep if there is a LoRa packet
-    if (gpio_get_level(wakeupPin) == HIGH) {
+    // Skip sleep if there is a LoRa packet, or the extra wake source (eg. sensor INT) is already active
+    if (gpio_get_level(wakeupPin) == HIGH || (extra_wake_pin >= 0 && gpio_get_level((gpio_num_t)extra_wake_pin) == HIGH)) {
       portEXIT_CRITICAL(&sleepMux);
       delay(1);
       return;
@@ -101,6 +102,9 @@ public:
     // Configure GPIO wakeup
     esp_sleep_enable_gpio_wakeup();
     gpio_wakeup_enable((gpio_num_t)wakeupPin, GPIO_INTR_HIGH_LEVEL); // Wake up when receiving a LoRa packet
+    if (extra_wake_pin >= 0) {
+      gpio_wakeup_enable((gpio_num_t)extra_wake_pin, GPIO_INTR_HIGH_LEVEL);  // Wake up on active-high sensor interrupt
+    }
 
     // MCU enters light sleep
     esp_light_sleep_start();
@@ -108,6 +112,10 @@ public:
     // Avoid ISR flood during wakeup due to HIGH LEVEL interrupt
     gpio_wakeup_disable(wakeupPin);
     gpio_set_intr_type(wakeupPin, GPIO_INTR_POSEDGE);
+    if (extra_wake_pin >= 0) {
+      gpio_wakeup_disable((gpio_num_t)extra_wake_pin);
+      gpio_set_intr_type((gpio_num_t)extra_wake_pin, GPIO_INTR_DISABLE);  // polled by app, no ISR attached
+    }
 
     // Enable CPU interrupt servicing
     portEXIT_CRITICAL(&sleepMux);
@@ -161,6 +169,10 @@ public:
 
   void setInhibitSleep(bool inhibit) {
     inhibit_sleep = inhibit;
+  }
+
+  void setExtraWakePin(int pin) {
+    extra_wake_pin = pin;
   }
 
   uint32_t getResetReason() const override {

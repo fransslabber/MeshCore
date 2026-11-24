@@ -69,6 +69,12 @@
 
 #define ALERT_ACK_EXPIRY_MILLIS         8000   // wait 8 secs for ACKs to alert messages
 
+#if ALERT_DEBUG
+  #define ALERT_LOG(F, ...) Serial.printf("ALERT: " F "\n", ##__VA_ARGS__)
+#else
+  #define ALERT_LOG(...) {}
+#endif
+
 static File openAppend(FILESYSTEM* _fs, const char* fname) {
   #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
     return _fs->open(fname, FILE_O_WRITE);
@@ -274,13 +280,82 @@ void SensorMesh::sendAlert(const ClientInfo* c, Trigger* t) {
   auto pkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, c->id, c->shared_secret, data, 5 + text_len);
   if (pkt) {
     if (c->out_path_len != OUT_PATH_UNKNOWN) {  // we have an out_path, so send DIRECT
+      ALERT_LOG("send '%s' to %02X%02X%02X%02X attempt %d DIRECT (path_len=%d)", t->text,
+                c->id.pub_key[0], c->id.pub_key[1], c->id.pub_key[2], c->id.pub_key[3], t->attempt - 1, (int)c->out_path_len);
       sendDirect(pkt, c->out_path, c->out_path_len);
     } else {
+      ALERT_LOG("send '%s' to %02X%02X%02X%02X attempt %d FLOOD%s", t->text,
+                c->id.pub_key[0], c->id.pub_key[1], c->id.pub_key[2], c->id.pub_key[3], t->attempt - 1,
+                default_scope.isNull() ? "" : " (scoped)");
       unsigned long delay_millis = 0;
       sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
     }
+  } else {
+    ALERT_LOG("ERROR: unable to create alert packet (pool full?)");
   }
   t->send_expiry = futureMillis(ALERT_ACK_EXPIRY_MILLIS);
+}
+
+#define ALERT_CHANNEL_FILE  "/alert_ch"
+
+void SensorMesh::setAlertChannel(const uint8_t key[16]) {
+  memset(alert_channel.secret, 0, sizeof(alert_channel.secret));
+  memcpy(alert_channel.secret, key, 16);
+  mesh::Utils::sha256(alert_channel.hash, sizeof(alert_channel.hash), alert_channel.secret, 16);
+  alert_channel_set = true;
+}
+
+void SensorMesh::loadAlertChannel() {
+  alert_channel_set = false;
+  if (_fs->exists(ALERT_CHANNEL_FILE)) {
+#if defined(RP2040_PLATFORM)
+    File f = _fs->open(ALERT_CHANNEL_FILE, "r");
+#else
+    File f = _fs->open(ALERT_CHANNEL_FILE);
+#endif
+    if (f) {
+      uint8_t key[16];
+      if (f.read(key, 16) == 16) setAlertChannel(key);
+      f.close();
+    }
+  }
+}
+
+void SensorMesh::saveAlertChannel() {
+  _fs->remove(ALERT_CHANNEL_FILE);
+  if (!alert_channel_set) return;
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  File f = _fs->open(ALERT_CHANNEL_FILE, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  File f = _fs->open(ALERT_CHANNEL_FILE, "w");
+#else
+  File f = _fs->open(ALERT_CHANNEL_FILE, "w", true);
+#endif
+  if (f) {
+    f.write(alert_channel.secret, 16);
+    f.close();
+  }
+}
+
+void SensorMesh::sendAlertToChannel(const char* text) {
+  if (!alert_channel_set) return;
+
+  uint8_t data[MAX_PACKET_PAYLOAD];
+  uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+  memcpy(data, &ts, 4);
+  data[4] = 0;  // TXT_TYPE_PLAIN
+  int max_len = MAX_PACKET_PAYLOAD - 5 - CIPHER_BLOCK_SIZE - CIPHER_MAC_SIZE - PATH_HASH_SIZE - 1;
+  int len = snprintf((char *)&data[5], max_len, "%s: %s", _prefs.node_name, text);   // <sender>: <msg>  (same as chat nodes)
+  if (len < 0) return;
+  if (len >= max_len) len = max_len - 1;
+
+  auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, alert_channel, data, 5 + len);
+  if (pkt) {
+    ALERT_LOG("channel post '%s'", text);
+    sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
+  } else {
+    ALERT_LOG("ERROR: unable to create channel packet");
+  }
 }
 
 void SensorMesh::alertIf(bool condition, Trigger& t, AlertPriority pri, const char* text) {
@@ -293,6 +368,8 @@ void SensorMesh::alertIf(bool condition, Trigger& t, AlertPriority pri, const ch
       t.curr_contact_idx = -1;  // start iterating thru contacts[]
 
       alert_tasks[num_alert_tasks++] = &t;  // add to queue
+      sendAlertToChannel(text);   // also post (once, no ACK) to the alert channel, if configured
+      ALERT_LOG("queued '%s' (%d contacts in ACL)", text, acl.getNumClients());
     }
   } else {
     if (t.isTriggered()) {
@@ -462,7 +539,39 @@ void SensorMesh::handleCommand(ClientInfo* from, uint32_t sender_timestamp, char
   }
 
   // handle sensor-specific CLI commands
-  if (memcmp(command, "setperm ", 8) == 0) {   // format:  setperm {pubkey-hex} {permissions-int8}
+  if (strcmp(command, "alert.channel") == 0) {
+    if (alert_channel_set) {
+      char hex[33];
+      mesh::Utils::toHex(hex, alert_channel.secret, 16);
+      sprintf(reply, "alert channel key: %s", hex);
+    } else {
+      strcpy(reply, "alert channel: off");
+    }
+  } else if (memcmp(command, "alert.channel ", 14) == 0) {   // format: alert.channel {#hashtag | 32-hex-key | off}
+    const char* arg = &command[14];
+    uint8_t key[16];
+    bool ok = true;
+    if (strcmp(arg, "off") == 0) {
+      alert_channel_set = false;
+    } else if (arg[0] == '#' && strlen(arg) > 1) {
+      mesh::Utils::sha256(key, 16, (const uint8_t*)arg, strlen(arg));   // hashtag channel: key = sha256("#name")[0..15]
+      setAlertChannel(key);
+    } else if (strlen(arg) == 32 && mesh::Utils::fromHex(key, 16, arg)) {
+      setAlertChannel(key);
+    } else {
+      ok = false;
+      strcpy(reply, "Err - use #name, 32 hex chars, or off");
+    }
+    if (ok) {
+      saveAlertChannel();
+      if (alert_channel_set) {
+        sendAlertToChannel("alert channel test");
+        strcpy(reply, "OK - test message sent to channel");
+      } else {
+        strcpy(reply, "OK - alert channel off");
+      }
+    }
+  } else if (memcmp(command, "setperm ", 8) == 0) {   // format:  setperm {pubkey-hex} {permissions-int8}
     char* hex = &command[8];
     char* sp = strchr(hex, ' ');   // look for separator char
     if (sp == NULL) {
@@ -772,6 +881,7 @@ void SensorMesh::onAckRecv(mesh::Packet* packet, uint32_t ack_crc) {
     auto t = alert_tasks[0];   // check current alert task
     for (int i = 0; i < t->attempt; i++) {
       if (ack_crc == t->expected_acks[i]) {   // matching ACK!
+        ALERT_LOG("ACK received for '%s' (attempt %d)", t->text, i);
         t->attempt = 4;  // signal to move to next contact
         t->send_expiry = 0;
         packet->markDoNotRetransmit();   // ACK was for this node, so don't retransmit
@@ -791,6 +901,7 @@ SensorMesh::SensorMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millise
   dirty_contacts_expiry = 0;
   last_read_time = 0;
   num_alert_tasks = 0;
+  alert_channel_set = false;
   set_radio_at = revert_radio_at = 0;
   recv_pkt_region = NULL;
   region_load_active = false;
@@ -834,6 +945,7 @@ void SensorMesh::begin(FILESYSTEM* fs) {
 
   acl.load(_fs, self_id);
   region_map.load(_fs);
+  loadAlertChannel();
 
   // establish default-scope
   {
@@ -1080,6 +1192,7 @@ void SensorMesh::loop() {
       if (t->attempt >= 4) {  // max attempts reached, try next contact
         t->curr_contact_idx++;
         if (t->curr_contact_idx >= acl.getNumClients()) {  // no more contacts to try?
+          ALERT_LOG("done with '%s' (%d contacts checked)", t->text, acl.getNumClients());
           num_alert_tasks--;   // remove t from queue
           for (int i = 0; i < num_alert_tasks; i++) {
             alert_tasks[i] = alert_tasks[i + 1];
@@ -1095,6 +1208,7 @@ void SensorMesh::loop() {
 
             sendAlert(c, t);  // NOTE: modifies attempt, expected_acks[] and send_expiry
           } else {
+            ALERT_LOG("skip contact #%d (perms %02X, no alert permission)", t->curr_contact_idx, c->permissions);
             // next contact tested in next ::loop()
           }
         }

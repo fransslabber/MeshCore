@@ -59,6 +59,7 @@ public:
   const char* getRole() override { return FIRMWARE_ROLE; }
   const char* getNodeName() { return _prefs.node_name; }
   NodePrefs* getNodePrefs() { return &_prefs; }
+  bool hasPendingWork() const { return _mgr->getOutboundTotal() > 0 || num_alert_tasks > 0; }  // don't sleep while sending, or awaiting alert ACKs
   void savePrefs() override { _cli.savePrefs(_fs); }
   bool formatFileSystem() override;
   void sendSelfAdvertisement(int delay_millis, bool flood) override;
@@ -170,6 +171,14 @@ private:
   mesh::Packet* createSelfAdvert();
 
   void sendAlert(const ClientInfo* c, Trigger* t);
+
+  // optional group channel that alerts are also posted to (visible in the app's channel list)
+  mesh::GroupChannel alert_channel;
+  bool alert_channel_set;
+  void setAlertChannel(const uint8_t key[16]);
+  void loadAlertChannel();
+  void saveAlertChannel();
+  void sendAlertToChannel(const char* text);
 
   #if ENV_INCLUDE_GPS == 1
   void applyGpsPrefs() {
